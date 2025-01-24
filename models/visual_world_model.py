@@ -161,6 +161,8 @@ class VWorldModel(nn.Module):
         output: obs: (b, num_frames, 3, img_size, img_size)
         """
         b, num_frames, num_patches, emb_dim = z_obs["visual"].shape
+        if num_patches == 1:
+            z_obs['visual'] = z_obs['visual'].repeat(1, 1, int(self.encoder_image_size/self.encoder.patch_size)**2, 1)
         visual, diff = self.decoder(z_obs["visual"])  # (b*num_frames, 3, 224, 224)
         visual = rearrange(visual, "(b t) c h w -> b t c h w", t=num_frames)
         obs = {
