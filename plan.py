@@ -21,6 +21,9 @@ from preprocessor import Preprocessor
 from planning.evaluator import PlanEvaluator
 from utils import cfg_to_dict, seed
 
+from models.visual_world_model import VOWorldModel
+
+
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
 
@@ -129,7 +132,7 @@ class PlanWorkspace:
         self.device = next(wm.parameters()).device
 
         # have different seeds for each planning instances
-        self.eval_seed = [cfg_dict["seed"] * n + 1 for n in range(cfg_dict["n_evals"])]
+        self.eval_seed = [cfg_dict["seed"] * (n+1) + 1 for n in range(cfg_dict["n_evals"])]
         print("eval_seed: ", self.eval_seed)
         self.n_evals = cfg_dict["n_evals"]
         self.goal_source = cfg_dict["goal_source"]
@@ -150,6 +153,8 @@ class PlanWorkspace:
             proprio_std=self.dset.proprio_std,
             transform=self.dset.transform,
         )
+
+        print("INFO: self.dset.transform: ", self.dset.transform)
 
         if self.cfg_dict["goal_source"] == "file":
             self.prepare_targets_from_file(cfg_dict["goal_file_path"])
@@ -393,19 +398,42 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device):
     elif not train_cfg.has_decoder:
         result["decoder"] = None
 
-    model = hydra.utils.instantiate(
-        train_cfg.model,
-        encoder=result["encoder"],
-        proprio_encoder=result["proprio_encoder"],
-        action_encoder=result["action_encoder"],
-        predictor=result["predictor"],
-        decoder=result["decoder"],
-        proprio_dim=train_cfg.proprio_emb_dim,
-        action_dim=train_cfg.action_emb_dim,
-        concat_dim=train_cfg.concat_dim,
-        num_action_repeat=num_action_repeat,
-        num_proprio_repeat=train_cfg.num_proprio_repeat,
-    )
+    # object
+    if train_cfg['object']:
+        model = hydra.utils.instantiate(
+            train_cfg.model,
+            encoder=result["encoder"],
+            proprio_encoder=result["proprio_encoder"],
+            action_encoder=result["action_encoder"],
+            predictor=result["predictor"],
+            decoder=result["decoder"],
+            proprio_dim=train_cfg.proprio_emb_dim,
+            action_dim=train_cfg.action_emb_dim,
+            concat_dim=train_cfg.concat_dim,
+            num_action_repeat=num_action_repeat,
+            num_proprio_repeat=train_cfg.num_proprio_repeat,  
+            num_clusters=train_cfg.num_clusters,
+            pos_dim=train_cfg.pos_dim,
+            pos_scale=train_cfg.pos_scale,
+            num_features=train_cfg.num_features,
+            use_coord=train_cfg.use_coord,
+            use_patch_info=train_cfg.use_patch_info,
+        )
+    else:
+        model = hydra.utils.instantiate(
+            train_cfg.model,
+            encoder=result["encoder"],
+            proprio_encoder=result["proprio_encoder"],
+            action_encoder=result["action_encoder"],
+            predictor=result["predictor"],
+            decoder=result["decoder"],
+            proprio_dim=train_cfg.proprio_emb_dim,
+            action_dim=train_cfg.action_emb_dim,
+            concat_dim=train_cfg.concat_dim,
+            num_action_repeat=num_action_repeat,
+            num_proprio_repeat=train_cfg.num_proprio_repeat,  
+        )
+    
     model.to(device)
     return model
 
@@ -432,7 +460,9 @@ def planning_main(cfg_dict):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if cfg_dict["wandb_logging"]:
         wandb_run = wandb.init(
-            project=f"plan_{cfg_dict['planner']['name']}", config=cfg_dict
+            project=f"plan_{cfg_dict['planner']['name']}", 
+            config=cfg_dict,
+            entity='nikriz_1',
         )
         wandb.run.name = "{}".format(output_dir.split("plan_outputs/")[-1])
     else:
@@ -457,23 +487,26 @@ def planning_main(cfg_dict):
         Path(model_path) / "checkpoints" / f"model_{cfg_dict['model_epoch']}.pth"
     )
     model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
-
+    model_cfg_env_name = model_cfg.env.name[:-7] if 'object' in model_cfg.env.name else model_cfg.env.name
+    print("INFO: model_cfg_env_name: ", model_cfg_env_name)
     # use dummy vector env for wall and deformable envs
-    if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
+    if model_cfg_env_name == "wall" or model_cfg_env_name == "deformable_env":
+        
         from env.serial_vector_env import SerialVectorEnv
         env = SerialVectorEnv(
             [
                 gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
+                    model_cfg_env_name, *model_cfg.env.args, **model_cfg.env.kwargs
                 )
                 for _ in range(cfg_dict["n_evals"])
             ]
         )
+
     else:
         env = SubprocVectorEnv(
             [
                 lambda: gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
+                    model_cfg_env_name, *model_cfg.env.args, **model_cfg.env.kwargs
                 )
                 for _ in range(cfg_dict["n_evals"])
             ]
@@ -484,7 +517,7 @@ def planning_main(cfg_dict):
         wm=model,
         dset=dset,
         env=env,
-        env_name=model_cfg.env.name,
+        env_name=model_cfg_env_name,
         frameskip=model_cfg.frameskip,
         wandb_run=wandb_run,
     )

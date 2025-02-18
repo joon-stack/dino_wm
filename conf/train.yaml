@@ -6,10 +6,10 @@ defaults:
   - proprio_encoder: proprio
   - decoder: vqvae
   - predictor: vit
-  - override hydra/launcher: submitit_slurm
+  - hydra/launcher: submitit_slurm
 
 # base path to save model outputs. Checkpoints will be saved to ${ckpt_base_path}/outputs.
-ckpt_base_path: /shared/s2/lab01/youngjoonjeong/dino_wm_oc # put absolute path here
+ckpt_base_path: /home/shared/youngjoon/dino_wm_oc # put absolute path here
 
 hydra:
   run:
@@ -20,20 +20,22 @@ hydra:
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
     nodes: 1
-    tasks_per_node: 1
+    tasks_per_node: 2
     cpus_per_task: 8
-    mem_gb: 512
-    gres: "gpu:h100:1"
+    mem_gb: 20
+    gres: "gpu:2"
     timeout_min: 2880
     setup: ["export DEBUGVAR=$(scontrol show hostnames $SLURM_JOB_NODELIST)",
             export MASTER_ADDR="$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)",
             "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
+
 
 training:
   seed: 0
   epochs: 100
   batch_size: 32 # should >= nodes * tasks_per_node
   save_every_x_epoch: 10
+  save_every_x_steps: null
   reconstruct_every_x_batch: 500
   num_reconstruct_samples: 6
   encoder_lr: 1e-6
@@ -79,3 +81,7 @@ plan_settings:
   goal_source: ['dset', 'random_state']
   goal_H: [5]
   alpha: [0.1, 1]
+
+# Object params
+object: False
+num_clusters: null

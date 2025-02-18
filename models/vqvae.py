@@ -200,6 +200,8 @@ class VQVAE(nn.Module):
             input: (b, t, num_patches, emb_dim)
         '''
         num_patches = input.shape[2]
+
+
         num_side_patches = int(num_patches ** 0.5)    
         input = rearrange(input, "b t (h w) e -> (b t) h w e", h=num_side_patches, w=num_side_patches)
 

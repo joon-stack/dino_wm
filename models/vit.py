@@ -118,3 +118,29 @@ class ViTPredictor(nn.Module):
         x = self.dropout(x) 
         x = self.transformer(x) 
         return x
+
+    
+class ObjectViTPredictor(nn.Module):
+    def __init__(self, *, num_patches, num_frames, dim, depth, heads, mlp_dim, pool='cls', dim_head=64, dropout=0., emb_dropout=0.):
+        super().__init__()
+        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
+        
+        # update params for adding causal attention masks
+        global NUM_FRAMES, NUM_PATCHES
+        NUM_FRAMES = num_frames
+        NUM_PATCHES = num_patches
+
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, dim)) 
+        self.dropout = nn.Dropout(emb_dropout)
+        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+        self.pool = pool
+        self.num_patches = num_patches
+        self.num_frames = num_frames
+
+    def forward(self, x): # x: (b, window_size * H/patch_size * W/patch_size, 384)
+        b, n, _ = x.shape
+        frame_pe = repeat(self.pos_embedding, '1 f d -> 1 (f p) d', p=self.num_patches)
+        x = x + frame_pe[:, :n]
+        x = self.dropout(x) 
+        x = self.transformer(x) 
+        return x

@@ -108,7 +108,66 @@ class PointMazeDataset(TrajDataset):
             raise NotImplementedError
         elif isinstance(imgs, torch.Tensor):
             return rearrange(imgs, "b h w c -> b c h w") / 255.0
+
+class PointMazeObjectDataset(PointMazeDataset):
+    def __init__(
+        self,
+        data_path: str = "data/point_maze",
+        n_rollout: Optional[int] = None,
+        transform: Optional[Callable] = None,
+        normalize_action: bool = False,
+        action_scale=1.0,
+        num_clusters=4,
+        num_features=3,
+        encoder=None,
+        use_coord=False,
+        use_patch_info=False,
+    ):
+        super().__init__(
+            data_path=data_path,
+            n_rollout=n_rollout,
+            transform=transform,
+            normalize_action=normalize_action,
+            action_scale=action_scale,
+        )
+
+        self.num_clusters = num_clusters
+        self.encoder = encoder
+        self.num_features = num_features
+        self.use_coord = use_coord
+        self.use_patch_info = use_patch_info
+
+    def get_frames(self, idx, frames):
+        z_dir = self.data_path / f"objects_{self.encoder}_{self.num_clusters}_feat{self.num_features}"
+        z = np.load(z_dir / f"episode_{idx:05d}.npy")
+        z = torch.tensor(z)
+
+        if self.use_coord:
+            pos_dir = z_dir / f"coord_{idx:05d}.npy"
+            pos = np.load(pos_dir)
+            pos = torch.tensor(pos)
         
+        if self.use_patch_info:
+            pos_dir = z_dir / f"patch_{idx:05d}.npy"
+            pos = np.load(pos_dir)
+            pos = torch.tensor(pos).to(torch.float32)
+
+        obs_dir = self.data_path / "obses"
+        image = torch.load(obs_dir / f"episode_{idx:03d}.pth")
+
+        image = image[frames]  # THWC
+        image = image / 255.0
+        image = rearrange(image, "T H W C -> T C H W")
+        if self.transform:
+            image = self.transform(image)
+
+        act = self.actions[idx, frames]
+        state = self.states[idx, frames]
+        proprio = self.proprios[idx, frames]
+        
+        obs = {'z': z, 'proprio': proprio, 'visual': image, 'pos': pos}
+        return obs, act, state, {} # env_info
+
 def load_point_maze_slice_train_val(
     transform,
     n_rollout=50,
@@ -118,13 +177,33 @@ def load_point_maze_slice_train_val(
     num_hist=0,
     num_pred=0,
     frameskip=0,
+    object=False,
+    encoder=None,
+    num_clusters=4,
+    num_features=3,
+    use_coord=False,
+    use_patch_info=False,
 ):
-    dset = PointMazeDataset(
-        n_rollout=n_rollout,
-        transform=transform,
-        data_path=data_path,
-        normalize_action=normalize_action,
-    )
+    if object:
+        dset = PointMazeObjectDataset(
+            n_rollout=n_rollout,
+            transform=transform,
+            data_path=data_path,
+            normalize_action=normalize_action,
+            num_clusters=num_clusters,
+            num_features=num_features,
+            encoder=encoder,
+            use_coord=use_coord,
+            use_patch_info=use_patch_info,
+        )
+    else:
+        dset = PointMazeDataset(
+            n_rollout=n_rollout,
+            transform=transform,
+            data_path=data_path,
+            normalize_action=normalize_action,
+        )
+   
     dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
         traj_dataset=dset, 
         train_fraction=split_ratio, 

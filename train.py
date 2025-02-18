@@ -22,6 +22,7 @@ from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from metrics.image_metrics import eval_images
 from utils import slice_trajdict_with_t, cfg_to_dict, seed, sample_tensors
+from accelerate.data_loader import skip_first_batches
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ class Trainer:
         with open_dict(cfg):
             cfg["saved_folder"] = os.getcwd()
             log.info(f"Model saved dir: {cfg['saved_folder']}")
+
         cfg_dict = cfg_to_dict(cfg)
         model_name = cfg_dict["saved_folder"].split("outputs/")[-1]
         model_name += f"_{self.cfg.env.name}_f{self.cfg.frameskip}_h{self.cfg.num_hist}_p{self.cfg.num_pred}"
@@ -113,7 +115,17 @@ class Trainer:
                 f.write(OmegaConf.to_yaml(cfg, resolve=True))
 
         seed(cfg.training.seed)
-        log.info(f"Loading dataset from {self.cfg.env.dataset.data_path} ...")
+        if self.cfg.object:
+            try:
+                log.info(f"Loading dataset from {self.cfg.env.dataset.data_path} / {self.cfg.env.dataset.object_name} ...")
+            except:
+                log.info(f"Loading dataset from {self.cfg.env.dataset.data_path} ...")
+            log.info(f"Encoder: {self.cfg.env.dataset.encoder}")
+            log.info(f"Number of clusters: {self.cfg.env.dataset.num_clusters}")
+            log.info(f"Transform: {self.cfg.env.dataset.transform._target_}, {self.cfg.env.dataset.transform.img_size}")
+        else:
+            log.info(f"Loading dataset from {self.cfg.env.dataset.data_path} ...")
+            
         self.datasets, traj_dsets = hydra.utils.call(
             self.cfg.env.dataset,
             num_hist=self.cfg.num_hist,
@@ -156,6 +168,7 @@ class Trainer:
 
         self._keys_to_save = [
             "epoch",
+            "global_step"
         ]
         self._keys_to_save += (
             ["encoder", "encoder_optimizer"] if self.train_encoder else []
@@ -169,13 +182,24 @@ class Trainer:
             ["decoder", "decoder_optimizer"] if self.train_decoder else []
         )
         self._keys_to_save += ["action_encoder", "proprio_encoder"]
+        self.global_step = 0
 
         self.init_models()
         self.init_optimizers()
 
         self.epoch_log = OrderedDict()
+        
+        
+        # 저장 방식 검증
+        if (cfg.training.save_every_x_epoch is not None and 
+            cfg.training.save_every_x_steps is not None):
+            raise ValueError("Cannot set both save_every_x_epoch and save_every_x_steps")
+        if (cfg.training.save_every_x_epoch is None and 
+            cfg.training.save_every_x_steps is None):
+            raise ValueError("Must set either save_every_x_epoch or save_every_x_steps")
 
-    def save_ckpt(self):
+
+    def save_ckpt(self, step=None):
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
             if not os.path.exists("checkpoints"):
@@ -187,9 +211,15 @@ class Trainer:
                 else:
                     ckpt[k] = self.__dict__[k]
             torch.save(ckpt, "checkpoints/model_latest.pth")
-            torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
+
+            # 단계 또는 에포크 정보로 추가 저장
+            if step is not None:
+                filename = f"checkpoints/model_step{step}.pth"
+            else:
+                filename = f"checkpoints/model_epoch{self.epoch}.pth"
+            torch.save(ckpt, filename)
             log.info("Saved model to {}".format(os.getcwd()))
-            ckpt_path = os.path.join(os.getcwd(), f"checkpoints/model_{self.epoch}.pth")
+            ckpt_path = os.path.join(os.getcwd(), filename)
         else:
             ckpt_path = None
         model_name = self.cfg["saved_folder"].split("outputs/")[-1]
@@ -197,7 +227,7 @@ class Trainer:
         return ckpt_path, model_name, model_epoch
 
     def load_ckpt(self, filename="model_latest.pth"):
-        ckpt = torch.load(filename)
+        ckpt = torch.load(filename, map_location=self.device)  # 디바이스 명시적 지정
         for k, v in ckpt.items():
             self.__dict__[k] = v
         not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
@@ -208,7 +238,7 @@ class Trainer:
         model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
         if model_ckpt.exists():
             self.load_ckpt(model_ckpt)
-            log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
+            log.info(f"Resuming from epoch {self.epoch}, step {self.global_step}: {model_ckpt}")
 
         # initialize encoder
         if self.encoder is None:
@@ -253,19 +283,52 @@ class Trainer:
         if self.cfg.concat_dim == 0:
             num_patches += 2
 
+        if self.cfg.object in ['cluster']:
+            num_patches = self.cfg.num_clusters * self.cfg.num_features
+            print(f"Using {self.cfg.object}-based predictor with {self.cfg.num_clusters} patches with {self.cfg.num_features} features each")
+        elif self.cfg.object in ['slot']:
+            num_patches = self.cfg.num_clusters 
+            print(f"Using {self.cfg.object}-based predictor with {self.cfg.num_clusters} slots ")
+        
         if self.cfg.has_predictor:
             if self.predictor is None:
-                self.predictor = hydra.utils.instantiate(
-                    self.cfg.predictor,
-                    num_patches=num_patches,
-                    num_frames=self.cfg.num_hist,
-                    dim=self.encoder.emb_dim
-                    + (
-                        proprio_emb_dim * self.cfg.num_proprio_repeat
-                        + action_emb_dim * self.cfg.num_action_repeat
+                if self.cfg.object == 'cluster':
+                    self.predictor = hydra.utils.instantiate(
+                        self.cfg.predictor,
+                        num_patches=num_patches,
+                        num_frames=self.cfg.num_hist,
+                        dim=self.encoder.emb_dim
+                        + (
+                            proprio_emb_dim * self.cfg.num_proprio_repeat
+                            + action_emb_dim * self.cfg.num_action_repeat
+                            + self.cfg.pos_dim
+                        )
+                        * (self.cfg.concat_dim),
                     )
-                    * (self.cfg.concat_dim),
-                )
+                elif self.cfg.object == 'slot':
+                    self.predictor = hydra.utils.instantiate(
+                        self.cfg.predictor,
+                        num_patches=num_patches,
+                        num_frames=self.cfg.num_hist,
+                        dim=128
+                        + (
+                            proprio_emb_dim * self.cfg.num_proprio_repeat
+                            + action_emb_dim * self.cfg.num_action_repeat
+                        )
+                        * (self.cfg.concat_dim),
+                    )
+                else:
+                    self.predictor = hydra.utils.instantiate(
+                        self.cfg.predictor,
+                        num_patches=num_patches,
+                        num_frames=self.cfg.num_hist,
+                        dim=self.encoder.emb_dim
+                        + (
+                            proprio_emb_dim * self.cfg.num_proprio_repeat
+                            + action_emb_dim * self.cfg.num_action_repeat
+                        )
+                        * (self.cfg.concat_dim),
+                    )
             if not self.train_predictor:
                 for param in self.predictor.parameters():
                     param.requires_grad = False
@@ -294,19 +357,55 @@ class Trainer:
         self.encoder, self.predictor, self.decoder = self.accelerator.prepare(
             self.encoder, self.predictor, self.decoder
         )
-        self.model = hydra.utils.instantiate(
-            self.cfg.model,
-            encoder=self.encoder,
-            proprio_encoder=self.proprio_encoder,
-            action_encoder=self.action_encoder,
-            predictor=self.predictor,
-            decoder=self.decoder,
-            proprio_dim=proprio_emb_dim,
-            action_dim=action_emb_dim,
-            concat_dim=self.cfg.concat_dim,
-            num_action_repeat=self.cfg.num_action_repeat,
-            num_proprio_repeat=self.cfg.num_proprio_repeat,
-        )
+        if not self.cfg.object:
+            self.model = hydra.utils.instantiate(
+                self.cfg.model,
+                encoder=self.encoder,
+                proprio_encoder=self.proprio_encoder,
+                action_encoder=self.action_encoder,
+                predictor=self.predictor,
+                decoder=self.decoder,
+                proprio_dim=proprio_emb_dim,
+                action_dim=action_emb_dim,
+                concat_dim=self.cfg.concat_dim,
+                num_action_repeat=self.cfg.num_action_repeat,
+                num_proprio_repeat=self.cfg.num_proprio_repeat,
+            )
+        elif self.cfg.object in ['cluster']:
+            self.model = hydra.utils.instantiate(
+                self.cfg.model,
+                encoder=self.encoder,
+                proprio_encoder=self.proprio_encoder,
+                action_encoder=self.action_encoder,
+                predictor=self.predictor,
+                decoder=self.decoder,
+                proprio_dim=proprio_emb_dim,
+                action_dim=action_emb_dim,
+                concat_dim=self.cfg.concat_dim,
+                num_action_repeat=self.cfg.num_action_repeat,
+                num_proprio_repeat=self.cfg.num_proprio_repeat,
+                num_clusters=self.cfg.num_clusters,
+                pos_dim=self.cfg.pos_dim,
+                pos_scale=self.cfg.pos_scale,
+                num_features=self.cfg.num_features,
+                use_coord=self.cfg.use_coord,
+                use_patch_info=self.cfg.use_patch_info,
+            )
+        elif self.cfg.object in ['slot']:
+            self.model = hydra.utils.instantiate(
+                self.cfg.model,
+                encoder=self.encoder,
+                proprio_encoder=self.proprio_encoder,
+                action_encoder=self.action_encoder,
+                predictor=self.predictor,
+                decoder=self.decoder,
+                proprio_dim=proprio_emb_dim,
+                action_dim=action_emb_dim,
+                concat_dim=self.cfg.concat_dim,
+                num_action_repeat=self.cfg.num_action_repeat,
+                num_proprio_repeat=self.cfg.num_proprio_repeat,
+                num_clusters=self.cfg.num_clusters,
+            )
 
     def init_optimizers(self):
         self.encoder_optimizer = torch.optim.Adam(
@@ -370,15 +469,23 @@ class Trainer:
             )
             self.monitor_thread.start()
 
-        init_epoch = self.epoch + 1  # epoch starts from 1
-        for epoch in range(init_epoch, init_epoch + self.total_epochs):
+        model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
+
+        if self.cfg.training.save_every_x_steps is not None and model_ckpt.exists():
+            init_epoch = self.epoch
+        else:
+            init_epoch = self.epoch + 1  # epoch starts from 1
+
+        remaining_epochs = self.total_epochs - self.epoch
+        
+        for epoch in range(init_epoch, init_epoch + remaining_epochs):
             self.epoch = epoch
             self.accelerator.wait_for_everyone()
             self.train()
             self.accelerator.wait_for_everyone()
             self.val()
             self.logs_flash(step=self.epoch)
-            if self.epoch % self.cfg.training.save_every_x_epoch == 0:
+            if (self.cfg.training.save_every_x_epoch is not None and self.epoch % self.cfg.training.save_every_x_epoch == 0):
                 ckpt_path, model_name, model_epoch = self.save_ckpt()
                 # main thread only: launch planning jobs on the saved ckpt
                 if (
@@ -442,8 +549,14 @@ class Trainer:
         return logs
 
     def train(self):
+        batches_per_epoch = len(self.dataloaders["train"])
+        batches_done = self.global_step % batches_per_epoch  # 현재 에포크에서 처리된 배치 수 계산
+        print("INFO: batches_done", batches_done)
+        dataloader = self.dataloaders["train"]
+        if batches_done > 0:
+            dataloader = skip_first_batches(dataloader, batches_done)  # 이미 처리된 배치 건너뛰기
         for i, data in enumerate(
-            tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train")
+            tqdm(dataloader, desc=f"Epoch {self.epoch} Train"), start=batches_done
         ):
             obs, act, state = data
             plot = i == 0  # only plot from the first batch
@@ -451,6 +564,7 @@ class Trainer:
             z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
                 obs, act
             )
+            self.global_step += 1
 
             self.encoder_optimizer.zero_grad()
             if self.cfg.has_decoder:
@@ -483,6 +597,7 @@ class Trainer:
                     z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
 
                     state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
+                    
                     err_logs = self.err_eval(z_obs_out, z_tgt)
 
                     err_logs = self.accelerator.gather_for_metrics(err_logs)
@@ -535,6 +650,11 @@ class Trainer:
 
             loss_components = {f"train_{k}": [v] for k, v in loss_components.items()}
             self.logs_update(loss_components)
+
+            if (self.cfg.training.save_every_x_steps is not None and 
+                self.global_step % self.cfg.training.save_every_x_steps == 0):
+                self.accelerator.wait_for_everyone()
+                self.save_ckpt(step=self.global_step)
 
     def val(self):
         self.model.eval()

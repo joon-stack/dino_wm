@@ -121,6 +121,104 @@ class DeformDataset(TrajDataset):
             return rearrange(imgs, "b h w c -> b c h w")
 
 
+class DeformObjectDataset(DeformDataset):
+    def __init__(
+        self,
+        data_path: str = "data/deformable",
+        object_name: str = "rope",
+        n_rollout: Optional[int] = None,
+        transform: Optional[Callable] = None,
+        normalize_action: bool = False,
+        action_scale=1.0,
+        num_clusters=4,
+        num_features=3,
+        encoder=None,
+        use_coord=False,
+        use_patch_info=False,
+    ):
+        super().__init__(
+            data_path=data_path,
+            object_name=object_name,
+            n_rollout=n_rollout,
+            transform=transform,
+            normalize_action=normalize_action,
+            action_scale=action_scale,
+        )
+
+        self.num_clusters = num_clusters
+        self.encoder = encoder
+        self.num_features = num_features
+        self.use_coord = use_coord
+        self.use_patch_info = use_patch_info
+    
+    def get_frames(self, idx, frames):
+        z_dir = Path(str(self.data_path) + f"_objects_{self.encoder}_{self.num_clusters}_feat{self.num_features}")
+        z = np.load(z_dir / f"episode_{idx:05d}.npy")
+        z = torch.tensor(z)
+
+        if self.use_coord:
+            pos_dir = z_dir / f"coord_{idx:05d}.npy"
+            pos = np.load(pos_dir)
+            pos = torch.tensor(pos)
+        
+        if self.use_patch_info:
+            pos_dir = z_dir / f"patch_{idx:05d}.npy"
+            pos = np.load(pos_dir)
+            pos = torch.tensor(pos).to(torch.float32)
+
+        obs_dir = self.data_path / f"{idx:06d}"
+        image = torch.load(obs_dir / "obses.pth")
+        image = image[frames]  # THWC
+        image = rearrange(image, "T H W C -> T C H W") / 255.0
+
+        proprio = self.proprios[idx, frames]
+        act = self.actions[idx, frames]
+        state = self.states[idx, frames]
+
+        obs = {"visual": image, "proprio": proprio, 'z': z, 'pos': pos}
+        return obs, act, state, {} # infos is None
+
+class DeformSlotDataset(DeformDataset):
+    def __init__(
+        self,
+        data_path: str = "data/deformable",
+        object_name: str = "rope",
+        n_rollout: Optional[int] = None,
+        transform: Optional[Callable] = None,
+        normalize_action: bool = False,
+        action_scale=1.0,
+        num_clusters=8,
+        encoder=None,
+    ):
+        super().__init__(
+            data_path=data_path,
+            object_name=object_name,
+            n_rollout=n_rollout,
+            transform=transform,
+            normalize_action=normalize_action,
+            action_scale=action_scale,
+        )
+
+        self.num_clusters = num_clusters
+        self.encoder = encoder
+    
+    def get_frames(self, idx, frames):
+        z_dir = Path(str(self.data_path) + "_SOLV")
+        z = np.load(z_dir / f"{idx:06d}.npy")
+        z = torch.tensor(z)
+
+        obs_dir = self.data_path / f"{idx:06d}"
+        image = torch.load(obs_dir / "obses.pth")
+        image = image[frames]  # THWC
+        image = rearrange(image, "T H W C -> T C H W") / 255.0
+
+        proprio = self.proprios[idx, frames]
+        act = self.actions[idx, frames]
+        state = self.states[idx, frames]
+
+        obs = {"visual": image, "proprio": proprio, 'z': z}
+        return obs, act, state, {} # infos is None
+
 def load_deformable_dset_slice_train_val(
     transform,
     n_rollout=50,
@@ -131,14 +229,45 @@ def load_deformable_dset_slice_train_val(
     num_hist=0,
     num_pred=0,
     frameskip=0,
+    object=None,
+    encoder=None,
+    num_clusters=4,
+    num_features=3,
+    use_coord=False,
+    use_patch_info=False,
 ):
-    dset = DeformDataset(
-        n_rollout=n_rollout,
-        transform=transform,
-        data_path=data_path,
-        object_name=object_name,
-        normalize_action=normalize_action,
-    )
+    if object == 'cluster':
+        dset = DeformObjectDataset(
+            n_rollout=n_rollout,
+            transform=transform,
+            data_path=data_path,
+            object_name=object_name,
+            normalize_action=normalize_action,
+            num_clusters=num_clusters,
+            num_features=num_features,
+            encoder=encoder,
+            use_coord=use_coord,
+            use_patch_info=use_patch_info,
+        )
+    elif object == 'slot':
+        dset = DeformSlotDataset(
+            n_rollout=n_rollout,
+            transform=transform,
+            data_path=data_path,
+            object_name=object_name,
+            normalize_action=normalize_action,
+            num_clusters=num_clusters,
+            encoder=encoder,
+        )
+    else:
+        dset = DeformDataset(
+            n_rollout=n_rollout,
+            transform=transform,
+            data_path=data_path,
+            object_name=object_name,
+            normalize_action=normalize_action,
+        )
+
     dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
         traj_dataset=dset,
         train_fraction=split_ratio,

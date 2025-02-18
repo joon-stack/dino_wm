@@ -12,6 +12,47 @@ from utils import (
     concat_trajdict,
 )
 from torchvision import utils
+import matplotlib.pyplot as plt
+
+def make_overlay(pos):
+    """
+    for visualization
+    input: 
+        pos (B, T, num_clusters, num_patches)
+        
+    output:
+        overlay: (B*T, H, W, 4)
+    """
+
+    np.random.seed(72)
+    color_map = [np.concatenate([np.random.random(3), [1.0]]) for _ in range(100)]
+    H = W = 224
+    B, T, num_clusters, num_patches = pos.shape
+    overlay = np.ones((B*T, H, W, 4))
+    overlay[:, :, :, 3] = 0
+    pos = rearrange(pos, "b t c p -> (b t) c p")
+    pos = torch.argmax(pos, dim=1) # (B*T, num_patches)
+    step_x = step_y = H // int(np.sqrt(num_patches))
+    patch_h = step_y
+    patch_w = step_x
+    grid_size = H // step_x
+    token_positions = np.array([
+                        (int(y * step_y + step_y//2), int(x * step_x + step_x//2))
+                        for y in range(grid_size) for x in range(grid_size)
+                    ])
+
+    for i in range(B*T):
+        for j in range(num_patches):
+            y, x = token_positions[j]
+            overlay[
+                i,
+                max(0, y-patch_h//2):min(H, y+patch_h//2),
+                max(0, x-patch_w//2):min(W, x+patch_w//2)
+            ]  = color_map[pos[i, j]]
+    
+    return overlay
+
+
 
 
 class PlanEvaluator:  # evaluator for planning
@@ -101,11 +142,26 @@ class PlanEvaluator:  # evaluator for planning
         trans_obs_g = move_to_device(
             self.preprocessor.transform_obs(self.obs_g), self.device
         )
+        # TODO: check
         with torch.no_grad():
             i_z_obses, _ = self.wm.rollout(
                 obs_0=trans_obs_0,
                 act=actions,
             )
+        
+        # print("INFO: i_z_obses.keys()", i_z_obses.keys())
+        # print("INFO: i_z_obses['pos'].shape", i_z_obses['pos'].shape)
+        try:
+            overlays = make_overlay(i_z_obses['pos']) # (B*T, H, W, 4)
+            for i, overlay in enumerate(overlays):
+                plt.clf()
+                plt.figure(figsize=(8,8))
+                plt.imshow(overlay)
+                plt.axis('off')
+                plt.savefig(f"{filename}_overlay_{i}.png")
+        except:
+            pass
+
         i_final_z_obs = self._get_trajdict_last(i_z_obses, action_len + 1)
 
         # rollout in env
@@ -129,19 +185,20 @@ class PlanEvaluator:  # evaluator for planning
 
         # plot trajs
         if self.wm.decoder is not None:
-            i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
-            i_visuals = self._mask_traj(
-                i_visuals, action_len + 1
-            )  # we have action_len + 1 states
-            e_visuals = self.preprocessor.transform_obs_visual(e_visuals)
-            e_visuals = self._mask_traj(e_visuals, action_len * self.frameskip + 1)
-            self._plot_rollout_compare(
-                e_visuals=e_visuals,
-                i_visuals=i_visuals,
-                successes=successes,
-                save_video=save_video,
-                filename=filename,
-            )
+            with torch.no_grad():
+                i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
+                i_visuals = self._mask_traj(
+                    i_visuals, action_len + 1
+                )  # we have action_len + 1 states
+                e_visuals = self.preprocessor.transform_obs_visual(e_visuals)
+                e_visuals = self._mask_traj(e_visuals, action_len * self.frameskip + 1)
+                self._plot_rollout_compare(
+                    e_visuals=e_visuals,
+                    i_visuals=i_visuals,
+                    successes=successes,
+                    save_video=save_video,
+                    filename=filename,
+                )
 
         return logs, successes, e_obses, e_states
 
@@ -167,14 +224,27 @@ class PlanEvaluator:  # evaluator for planning
         print(eval_results)
 
         visual_dists = np.linalg.norm(e_obs["visual"] - self.obs_g["visual"], axis=1)
+        # print("INFO: e_obs['visual'].shape", e_obs["visual"].shape)
+        # print("INFO: self.obs_g['visual'].shape", self.obs_g["visual"].shape)
         mean_visual_dist = np.mean(visual_dists)
         proprio_dists = np.linalg.norm(e_obs["proprio"] - self.obs_g["proprio"], axis=1)
         mean_proprio_dist = np.mean(proprio_dists)
 
+        
         e_obs = move_to_device(self.preprocessor.transform_obs(e_obs), self.device)
-        e_z_obs = self.wm.encode_obs(e_obs)
-        div_visual_emb = torch.norm(e_z_obs["visual"] - i_z_obs["visual"]).item()
+
+        with torch.no_grad():
+            e_z_obs = self.wm.encode_obs(e_obs)
+        if 'z' in e_z_obs:
+            div_visual_emb = torch.norm(e_z_obs["z"] - i_z_obs["z"]).item()
+        else:
+            div_visual_emb = torch.norm(e_z_obs["visual"] - i_z_obs["visual"]).item()
         div_proprio_emb = torch.norm(e_z_obs["proprio"] - i_z_obs["proprio"]).item()
+
+        print("Mean visual dist: ", mean_visual_dist)
+        print("Mean proprio dist: ", mean_proprio_dist)
+        print("Mean div visual emb: ", div_visual_emb)
+        print("Mean div proprio emb: ", div_proprio_emb)
 
         logs.update({
             "mean_visual_dist": mean_visual_dist,
